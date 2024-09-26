@@ -21,6 +21,17 @@ pub const Request = struct {
     operationName: ?[]const u8 = null,
 };
 
+/// Represents a standard GraphQL request with variables
+///
+/// see also these [GraphQL docs](https://graphql.org/learn/serving-over-http/#post-request)
+pub fn RequestWithVariables(T: type) type {
+    return struct {
+        query: []const u8,
+        operationName: ?[]const u8 = null,
+        variables: ?T = null,
+    };
+}
+
 pub const Location = struct {
     line: usize,
     column: usize,
@@ -192,9 +203,73 @@ pub const Client = struct {
             },
         }
     }
+
+    /// Sends a GraphQL Request to a server
+    ///
+    /// Callers are expected to call `deinit()` on the Owned type returned to free memory.
+    pub fn sendWithVariables(
+        self: *Self,
+        Variables: type,
+        request: RequestWithVariables(Variables),
+        comptime T: type,
+    ) RequestError!Owned(Response(T)) {
+        const headers = std.http.Client.Request.Headers{
+            .content_type = .{ .override = "application/json" },
+            .authorization = if (self.options.authorization) |authz| .{
+                .override = authz,
+            } else .default,
+        };
+
+        // same as std client.fetch(...) default server_header_buffer
+        var server_header_buffer: [16 * 1024]u8 = undefined;
+        var req = self.httpClient.open(
+            .POST,
+            // endpoint is validated on client init
+            self.options.endpoint.toUri() catch unreachable,
+            .{
+                .headers = headers,
+                .server_header_buffer = &server_header_buffer,
+            },
+        ) catch return error.Http;
+        defer req.deinit();
+        req.transfer_encoding = .chunked;
+        req.send() catch return error.Http;
+        serializeRequestWithVariables(Variables, request, req.writer()) catch return error.Serialization;
+        req.finish() catch return error.Http;
+        req.wait() catch return error.Http;
+        switch (req.response.status.class()) {
+            // client errors
+            .client_error => switch (req.response.status) {
+                .unauthorized => return error.NotAuthorized,
+                .forbidden => return error.Forbidden,
+                else => return error.Http,
+            },
+            // handle server errors
+            .server_error => return error.ServerError,
+            // handle "success"
+            else => {
+                std.log.debug("response {any}", .{req.response.status});
+                const body = req.reader().readAllAlloc(
+                    self.allocator,
+                    8192 * 2 * 2, // note: optimistic arb choice of buffer size
+                ) catch unreachable;
+                defer self.allocator.free(body);
+                const parsed = parseResponse(self.allocator, body, T) catch return error.Deserialization;
+                return Owned(Response(T)).fromJson(parsed);
+            },
+        }
+    }
 };
 
 fn serializeRequest(request: Request, writer: anytype) @TypeOf(writer).Error!void {
+    try std.json.stringify(
+        request,
+        .{ .emit_null_optional_fields = false },
+        writer,
+    );
+}
+
+fn serializeRequestWithVariables(T: type, request: RequestWithVariables(T), writer: anytype) @TypeOf(writer).Error!void {
     try std.json.stringify(
         request,
         .{ .emit_null_optional_fields = false },
